@@ -1,6 +1,6 @@
 {
   "name": "slopsmith-desktop",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Slopsmith desktop app with integrated audio engine, VST hosting, and amp modeling",
   "author": {
     "name": "Byron",
@@ -63,12 +63,18 @@
       "build/Release/*.node"
     ],
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "category": "Audio",
       "icon": "resources/icons"
     },
     "mac": {
-      "target": ["dmg", "zip"],
+      "target": [
+        "dmg",
+        "zip"
+      ],
       "category": "public.app-category.music",
       "icon": "resources/icons/icon.icns",
       "hardenedRuntime": true,
@@ -81,7 +87,9 @@
       }
     },
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "resources/icons/icon.ico"
     },
     "nsis": {
