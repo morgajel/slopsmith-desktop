@@ -23,7 +23,23 @@ namespace slopsmith::sandbox {
 // Bumped whenever the wire format changes incompatibly. Host and sandbox MUST
 // agree on this number during the `ready` handshake; mismatched versions abort
 // the spawn and fall back to in-process loading.
-inline constexpr uint32_t kProtocolVersion = 1;
+//
+// v2 changes vs v1:
+//   * AudioShmHeader splits writeIdx/readIdx into per-direction
+//     in*/out* pairs so input and output rings no longer share state.
+//   * MIDI is bundled into the audio shm per input slot (MidiQueue) instead
+//     of riding the control pipe per event; op::kMidiEvent is removed (the
+//     sandbox keeps a warn-and-drop handler as a paranoid v1 fallback).
+//   * setBlockSize is no longer "planned" — it's a real op gated by the
+//     audio-thread pause/drain/resume protocol described in vst-host/main.cpp.
+//
+// v3 (this PR, mid-review): SHM ABI cleanup — overflow accounting moved from
+//   a per-slot field on MidiQueue to a single AudioShmHeader.midiOverflows
+//   counter (per-slot was confusing under round-robin slot reuse). Bumped
+//   because mixed v2/v3 binaries would interpret different offsets for the
+//   MIDI queue + trailing header counters and silently corrupt ring data.
+//   v2 was never released externally; this is the first version that ships.
+inline constexpr uint32_t kProtocolVersion = 3;
 
 // Magic number stamped at the head of the audio shared memory so a stale
 // mapping from a crashed sandbox can be detected.
@@ -79,6 +95,11 @@ namespace op {
     inline constexpr const char* kListParameters = "listParameters";
     inline constexpr const char* kGetState       = "getState";
     inline constexpr const char* kSetState       = "setState";
+    // Removed as of protocol v2: MIDI now flows inline in the audio shm
+    // (see MidiQueue below). The version handshake rejects v1 hosts before
+    // they can reach this op, but the sandbox keeps a warn-log no-op
+    // handler as a paranoid fallback. Drop the handler when v1 host
+    // binaries are no longer in circulation.
     inline constexpr const char* kMidiEvent      = "midiEvent";
     inline constexpr const char* kOpenEditor     = "openEditor";
     inline constexpr const char* kResizeEditor   = "resizeEditor";
@@ -96,16 +117,59 @@ namespace event {
     inline constexpr const char* kGoodbye           = "goodbye";
 }
 
+// Per-block MIDI bundling.
+//
+// In v1 the host posted each MIDI event over the control pipe from the audio
+// thread, which is a classic priority-inversion footgun (mutex + overlapped
+// pipe I/O on the audio callback). v2 inlines MIDI in the audio shared memory
+// so the audio thread does no IPC beyond two atomic stores and a SetEvent.
+//
+// Layout: one `MidiQueue` per *input* slot (host → sandbox direction). The
+// host fills the upcoming slot's queue immediately before pushing the audio
+// block; the sandbox drains it immediately after popping the same slot.
+//
+// Caps are deliberately tight. SysEx > 4 bytes does not fit and is silently
+// dropped (overflow counter); a separate v3 op can carry it if a real
+// workload ever hits the case.
+inline constexpr uint32_t kMidiEventMaxBytes = 4;
+inline constexpr uint32_t kMidiEventsPerSlot = 64;
+
+struct MidiEvent
+{
+    uint32_t frame = 0;                          // sample offset within the block
+    uint32_t size  = 0;                          // 1..kMidiEventMaxBytes
+    uint8_t  bytes[kMidiEventMaxBytes] = {};
+};
+
+struct MidiQueue
+{
+    // `count` is published with release semantics by the host after the
+    // matching `events[]` entries are written; sandbox loads with acquire
+    // semantics. Accessed via std::atomic_ref<uint32_t> from .cpp so the
+    // shm layout stays trivially copyable.
+    alignas(8) uint32_t count = 0;
+    MidiEvent           events[kMidiEventsPerSlot] = {};
+    // Per-slot overflow was here in the first v2 cut, but slots are reused
+    // round-robin and the value would accumulate across all uses of that
+    // slot — confusing for any "did this block overflow?" reader, redundant
+    // for any "lifetime total" reader. Cumulative count lives in
+    // AudioShmHeader.midiOverflows.
+};
+
 // Shared-memory layout for the audio fast path.
 //
 // All offsets are bytes from the start of the mapping. Sized at spawn time
 // from the prepared sample rate / block size / channel count; the values
 // below are hard caps a sandbox will refuse to exceed.
 //
-// Atomic indices use std::atomic<uint64_t>. The host writes `writeIdx` and
-// reads `readIdx`; the sandbox is the inverse. Modulo-`maxBlocks` gives the
-// block slot. The producer drops blocks (incrementing `xruns`) rather than
-// blocking if the consumer is more than `maxBlocks` behind.
+// Atomic indices are stored as plain uint64_t for shm layout portability
+// and accessed via std::atomic_ref<uint64_t> at the call site (C++20). Don't
+// reintroduce reinterpret_cast to std::atomic<uint64_t>* — that's not
+// layout-guaranteed. Modulo-`maxBlocks` of an index gives the block slot.
+//
+// Per-direction split (v2): input ring (host → sandbox) and output ring
+// (sandbox → host) each get their own writer/reader index pair so the two
+// directions can advance independently without sharing state.
 struct AudioShmHeader
 {
     uint32_t magic = 0;             // kAudioShmMagic
@@ -115,23 +179,25 @@ struct AudioShmHeader
     uint32_t maxChannels = 0;
     uint32_t sampleRate = 0;
 
-    // Plain uint64_t for shm layout portability across the host/sandbox
-    // boundary. The .cpp side accesses each via std::atomic_ref<uint64_t>
-    // at the point of use (C++20). Don't reintroduce reinterpret_cast to
-    // std::atomic<uint64_t>* — that's not layout-guaranteed.
-    alignas(8) uint64_t writeIdx = 0;   // host increments
-    alignas(8) uint64_t readIdx  = 0;   // sandbox increments
-    // Both counters are direction-agnostic: either side bumps the same field.
-    // xruns covers any pushBlock where the destination ring was full;
-    // dropouts covers any popBlock that timed out waiting for the partner.
-    // Splitting per direction is on the audio-shm-MIDI follow-up checklist.
-    alignas(8) uint64_t xruns    = 0;
-    alignas(8) uint64_t dropouts = 0;
+    alignas(8) uint64_t inWriteIdx  = 0;  // host produces ring A (input audio + MIDI)
+    alignas(8) uint64_t inReadIdx   = 0;  // sandbox consumes ring A
+    alignas(8) uint64_t outWriteIdx = 0;  // sandbox produces ring B (output audio)
+    alignas(8) uint64_t outReadIdx  = 0;  // host consumes ring B
 
-    // Byte offsets of the two rings inside the mapping. Convenient for tools
-    // and asserts; computed at spawn time.
-    uint64_t inputRingOffset = 0;
+    // Direction-agnostic diagnostic counters. xruns covers any pushBlock
+    // where the destination ring was full; dropouts covers any popBlock that
+    // timed out waiting for the partner; midiOverflows covers any MIDI event
+    // dropped by pushInputBlock for being SysEx-sized or because the slot's
+    // MidiQueue already held kMidiEventsPerSlot entries.
+    alignas(8) uint64_t xruns         = 0;
+    alignas(8) uint64_t dropouts      = 0;
+    alignas(8) uint64_t midiOverflows = 0;
+
+    // Byte offsets of the two rings + per-slot MIDI region inside the mapping.
+    // Convenient for tools and asserts; computed at spawn time.
+    uint64_t inputRingOffset  = 0;
     uint64_t outputRingOffset = 0;
+    uint64_t midiQueueOffset  = 0;     // base of MidiQueue[maxBlocks]
     uint64_t ringBytesPerSlot = 0;
 };
 
@@ -157,8 +223,10 @@ struct AudioDimensions
 
     constexpr uint64_t totalShmBytes() const
     {
-        // Header + two rings.
-        return sizeof(AudioShmHeader) + 2 * uint64_t(maxBlocks) * bytesPerSlot();
+        // Header + two audio rings + per-input-slot MidiQueue.
+        return sizeof(AudioShmHeader)
+             + 2 * uint64_t(maxBlocks) * bytesPerSlot()
+             + uint64_t(maxBlocks) * sizeof(MidiQueue);
     }
 };
 

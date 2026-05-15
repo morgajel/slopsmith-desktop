@@ -1,4 +1,5 @@
 #include "AudioChannel.h"
+#include "../VSTTrace.h"
 
 #if JUCE_WINDOWS
  #include <windows.h>
@@ -17,6 +18,7 @@ struct AudioChannel::Impl
     AudioShmHeader* header = nullptr;
     float* inputRing = nullptr;   // host writes, sandbox reads
     float* outputRing = nullptr;  // sandbox writes, host reads
+    MidiQueue* midiQueues = nullptr; // [maxBlocks], one per input slot
 };
 
 AudioChannel::AudioChannel() : impl(std::make_unique<Impl>()) {}
@@ -62,13 +64,18 @@ bool AudioChannel::createHostSide(const AudioDimensions& dims, Names& namesOut,
     impl->header->maxBlockSamples = dims.maxBlockSamples;
     impl->header->maxChannels = dims.maxChannels;
     impl->header->sampleRate = dims.sampleRate;
-    impl->header->writeIdx = 0;
-    impl->header->readIdx = 0;
+    impl->header->inWriteIdx  = 0;
+    impl->header->inReadIdx   = 0;
+    impl->header->outWriteIdx = 0;
+    impl->header->outReadIdx  = 0;
     impl->header->xruns = 0;
     impl->header->dropouts = 0;
+    impl->header->midiOverflows = 0;
     impl->header->ringBytesPerSlot = dims.bytesPerSlot();
     impl->header->inputRingOffset  = sizeof(AudioShmHeader);
     impl->header->outputRingOffset = impl->header->inputRingOffset
+                                   + uint64_t(dims.maxBlocks) * dims.bytesPerSlot();
+    impl->header->midiQueueOffset  = impl->header->outputRingOffset
                                    + uint64_t(dims.maxBlocks) * dims.bytesPerSlot();
 
     // Release fence so all the header writes above are visible before the
@@ -83,6 +90,11 @@ bool AudioChannel::createHostSide(const AudioDimensions& dims, Names& namesOut,
     auto* base = reinterpret_cast<char*>(impl->view);
     impl->inputRing  = reinterpret_cast<float*>(base + impl->header->inputRingOffset);
     impl->outputRing = reinterpret_cast<float*>(base + impl->header->outputRingOffset);
+    impl->midiQueues = reinterpret_cast<MidiQueue*>(base + impl->header->midiQueueOffset);
+    // Zero-initialise the per-slot MidiQueues so a producer's first publish
+    // doesn't have to clear count/overflow bookkeeping.
+    std::memset(impl->midiQueues, 0,
+                sizeof(MidiQueue) * (size_t)dims.maxBlocks);
 
     impl->evtToHost = CreateEventW(
         nullptr, /*manualReset*/FALSE, /*initial*/FALSE,
@@ -205,16 +217,30 @@ bool AudioChannel::openSandboxSide(const Names& names, juce::String& errorOut)
     // against that. Anything beyond would be a stale/incompatible host
     // header that survived magic+version validation (unlikely but cheap
     // to catch — and the alternative is an out-of-bounds memcpy on the
-    // first pushBlock/popBlock).
+    // first push/popBlock or popInputBlock MIDI drain).
     const uint64_t expectedTotal = sizeof(AudioShmHeader)
-        + 2 * uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot;
+        + 2 * uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot
+        + uint64_t(impl->header->maxBlocks) * sizeof(MidiQueue);
     const uint64_t inEnd  = impl->header->inputRingOffset
         + uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot;
     const uint64_t outEnd = impl->header->outputRingOffset
         + uint64_t(impl->header->maxBlocks) * impl->header->ringBytesPerSlot;
-    if (inEnd > expectedTotal || outEnd > expectedTotal)
+    const uint64_t midiEnd = impl->header->midiQueueOffset
+        + uint64_t(impl->header->maxBlocks) * sizeof(MidiQueue);
+    // Bounds check: each region must fit within the mapping. Ordering
+    // check: regions must not overlap each other or the header. A
+    // malformed host header that satisfies magic + version + caps but
+    // reports e.g. midiQueueOffset == inputRingOffset would otherwise
+    // pass bounds yet silently corrupt audio/MIDI on every block. The
+    // canonical layout from createHostSide is: [header][input][output][midi].
+    if (inEnd > expectedTotal
+        || outEnd > expectedTotal
+        || midiEnd > expectedTotal
+        || impl->header->inputRingOffset  < sizeof(AudioShmHeader)
+        || impl->header->outputRingOffset < inEnd
+        || impl->header->midiQueueOffset  < outEnd)
     {
-        errorOut = "audio shm ring offsets out of bounds";
+        errorOut = "audio shm ring/MIDI offsets out of bounds or overlapping";
         close();
         return false;
     }
@@ -240,6 +266,7 @@ bool AudioChannel::openSandboxSide(const Names& names, juce::String& errorOut)
     auto* base = reinterpret_cast<char*>(impl->view);
     impl->inputRing  = reinterpret_cast<float*>(base + impl->header->inputRingOffset);
     impl->outputRing = reinterpret_cast<float*>(base + impl->header->outputRingOffset);
+    impl->midiQueues = reinterpret_cast<MidiQueue*>(base + impl->header->midiQueueOffset);
 
     impl->evtToHost    = OpenEventW(EVENT_ALL_ACCESS, FALSE,
                                     names.evtToHost.toWideCharPointer());
@@ -263,6 +290,7 @@ void AudioChannel::close()
     impl->header = nullptr;
     impl->inputRing = nullptr;
     impl->outputRing = nullptr;
+    impl->midiQueues = nullptr;
 }
 
 // std::atomic_ref needs C++20 (P0019, finalised in libstdc++ 11+ and recent
@@ -293,12 +321,45 @@ static std::atomic_ref<uint64_t> atomicAt(uint64_t& slot)
     return std::atomic_ref<uint64_t>(slot);
 }
 
+static std::atomic_ref<uint32_t> atomicAt32(uint32_t& slot)
+{
+    return std::atomic_ref<uint32_t>(slot);
+}
+
+namespace
+{
+    // Pick the right (write, read) index pair for a direction. Input ring
+    // (host → sandbox) is produced by host / consumed by sandbox; output
+    // ring (sandbox → host) is the inverse.
+    struct RingIndices { uint64_t& write; uint64_t& read; };
+
+    RingIndices indicesFor(AudioShmHeader& h, bool isOutputRing)
+    {
+        return isOutputRing
+             ? RingIndices{ h.outWriteIdx, h.outReadIdx }
+             : RingIndices{ h.inWriteIdx,  h.inReadIdx  };
+    }
+}
+
 bool AudioChannel::pushBlock(bool isOutputRing, const juce::AudioBuffer<float>& src,
                              int numSamples)
 {
+    // Input-direction pushes MUST go through pushInputBlock (which publishes
+    // the slot's MidiQueue alongside the audio). Calling pushBlock(false,…)
+    // directly would leave whatever MIDI count was in the slot from a prior
+    // pushInputBlock and the next popInputBlock would replay those stale
+    // events against fresh audio.
+    //
+    // jassert in debug + return false in release: a release-build regression
+    // would otherwise silently corrupt MIDI delivery rather than failing
+    // loudly. Today the only input producer is
+    // SandboxedProcessor::processBlock and it always calls pushInputBlock.
+    jassert(isOutputRing);
+    if (!isOutputRing) return false;
     if (!impl->header) return false;
-    auto writeIdx = atomicAt(impl->header->writeIdx);
-    auto readIdx  = atomicAt(impl->header->readIdx);
+    auto idx = indicesFor(*impl->header, isOutputRing);
+    auto writeIdx = atomicAt(idx.write);
+    auto readIdx  = atomicAt(idx.read);
     uint64_t w = writeIdx.load(std::memory_order_relaxed);
     uint64_t r = readIdx.load(std::memory_order_acquire);
     if (w - r >= impl->header->maxBlocks)
@@ -355,8 +416,9 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
 {
     if (!impl->header) return false;
     HANDLE evt = isOutputRing ? impl->evtToHost : impl->evtToSandbox;
-    auto writeIdx = atomicAt(impl->header->writeIdx);
-    auto readIdx  = atomicAt(impl->header->readIdx);
+    auto idx = indicesFor(*impl->header, isOutputRing);
+    auto writeIdx = atomicAt(idx.write);
+    auto readIdx  = atomicAt(idx.read);
 
     // Check indices BEFORE waiting. SetEvent on an auto-reset event is not
     // counting: if the producer signals twice in a row (queue 2 blocks),
@@ -371,18 +433,18 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
             atomicAt(impl->header->dropouts).fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        // Re-read; the wake might have been from teardown or another
-        // spurious source.
+        // Re-read; the wake might have been from teardown, an
+        // AudioPauseGuard's signalSandboxWake (every kPrepare /
+        // kSetBlockSize / kGetState / kSetState), or a kShutdown /
+        // disconnect callback. NONE of those are dropouts — they're
+        // intentional non-data wakes. Don't bump `dropouts` here or the
+        // counter pollutes every pause-guarded control op. Real
+        // dropouts are still counted on the WaitForSingleObject
+        // timeout path above and at the SandboxedProcessor pop-timeout
+        // call site.
         r = readIdx.load(std::memory_order_relaxed);
         w = writeIdx.load(std::memory_order_acquire);
-        if (w == r)
-        {
-            // Bump dropouts so the spurious-wake class is visible in the
-            // counters; otherwise it looks like a clean pop in operator
-            // logs but the caller still sees a failed return.
-            atomicAt(impl->header->dropouts).fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
+        if (w == r) return false;
     }
 
     auto slot = r % impl->header->maxBlocks;
@@ -394,6 +456,23 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
     const int dstCh      = dst.getNumChannels();
     const int channels   = juce::jmin((int)impl->header->maxChannels, dstCh);
     const int samples    = juce::jmin(maxSamples, numSamples);
+    if (numSamples > maxSamples)
+    {
+        // One-shot warn: caller passed more samples than the spawn-time cap
+        // allows, so we'll truncate to maxSamples and zero-fill the tail.
+        // Producer-side push paths apply the same clamp, so this fires only
+        // if a misconfigured consumer asks for too much (kPrepare /
+        // kSetBlockSize spawn-cap validation should have prevented it).
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel))
+        {
+            VST_TRACE("[audio-shm] popBlock: caller numSamples=%d > spawn cap "
+                      "maxBlockSamples=%d — truncating, tail zeroed",
+                      numSamples, maxSamples);
+        }
+    }
     for (int ch = 0; ch < channels; ++ch)
     {
         std::memcpy(dst.getWritePointer(ch),
@@ -411,6 +490,272 @@ bool AudioChannel::popBlock(bool isOutputRing, juce::AudioBuffer<float>& dst,
 
     readIdx.store(r + 1, std::memory_order_release);
     return true;
+}
+
+bool AudioChannel::pushInputBlock(const juce::AudioBuffer<float>& src,
+                                  const juce::MidiBuffer& midi,
+                                  int numSamples)
+{
+    // Inlined audio + MIDI publish so the slot's MidiQueue is published
+    // alongside the audio under the same inWriteIdx release. Earlier this
+    // method delegated to pushBlock(false, ...) for the audio half, but
+    // pushBlock used to clobber `count` to 0 between our MIDI publish and
+    // the inWriteIdx bump — every MIDI event was being dropped.
+    if (!impl->header || !impl->midiQueues) return false;
+    // Reject up front when the caller exceeds the spawn-time cap rather
+    // than silently truncating audio + dropping MIDI in [maxSamples,
+    // numSamples) into midiOverflows. Spawn-cap validation in kPrepare /
+    // kSetBlockSize should prevent this; if it ever fires the caller
+    // gets a `false` return — that's the diagnostic. Don't bump dropouts
+    // (it means "real audio dropout / missed deadline") or xruns (means
+    // "destination ring was full"); caller misuse is its own class and
+    // conflating them muddles operator-facing metrics.
+    //
+    // jassert in debug + return false in release — same fail-fast pattern
+    // as pushBlock(isOutputRing). Today the only producer
+    // (SandboxedProcessor::processBlock) bounds numSamples to JUCE's
+    // negotiated block size, so this branch is unreachable in practice;
+    // the assert flags any future caller that introduces a path where it
+    // becomes reachable.
+    jassert(numSamples <= (int)impl->header->maxBlockSamples);
+    if (numSamples > (int)impl->header->maxBlockSamples)
+        return false;
+
+    auto writeIdx = atomicAt(impl->header->inWriteIdx);
+    auto readIdx  = atomicAt(impl->header->inReadIdx);
+    uint64_t w = writeIdx.load(std::memory_order_relaxed);
+    uint64_t r = readIdx.load(std::memory_order_acquire);
+    if (w - r >= impl->header->maxBlocks)
+    {
+        atomicAt(impl->header->xruns).fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto slot = w % impl->header->maxBlocks;
+    auto& queue = impl->midiQueues[slot];
+
+    // Compute the truncated sample count up front so the MIDI loop below
+    // can clamp event frames against the SAME bound the audio copy uses.
+    // If the caller passed numSamples > maxSamples, both halves truncate
+    // to maxSamples consistently — otherwise the sandbox would receive
+    // MIDI frames pointing past the end of the audio it actually got.
+    const int maxCh      = (int)impl->header->maxChannels;
+    const int maxSamples = (int)impl->header->maxBlockSamples;
+    const int channels   = juce::jmin(maxCh, src.getNumChannels());
+    const int samples    = juce::jmin(maxSamples, numSamples);
+
+    // 1. Pack MIDI into the slot's queue. The slot is owned by the host
+    //    until we publish the new inWriteIdx below, so writes here are
+    //    private — no need for the relaxed-clear-then-release-store on
+    //    `count`, the release on inWriteIdx publishes both `count` and
+    //    `events[]` together. Using atomic_ref for the count store anyway
+    //    so the layout stays consistent for the sandbox-side acquire load.
+    uint32_t written = 0;
+    auto bumpMidiOverflow = [&](uint64_t n = 1)
+    {
+        // Global cumulative counter — per-slot was confusing because slots
+        // round-robin (the per-slot value would mix counts from many
+        // different blocks rather than answering "did THIS block
+        // overflow?"). Per-event accuracy past the cap is not a documented
+        // contract — the bulk-bump on cap-overflow keeps the audio thread
+        // from iterating arbitrarily many events on a real-time path.
+        atomicAt(impl->header->midiOverflows).fetch_add(n, std::memory_order_relaxed);
+    };
+    int scanned = 0;
+    const int totalEvents = midi.getNumEvents();
+    // Hard cap on iterations regardless of accept/reject ratio. The
+    // cap-overflow break below bounds the loop when events are valid-and-
+    // fit (written climbs to kMidiEventsPerSlot quickly), but a flood of
+    // pure SysEx would never increment `written` and could otherwise
+    // iterate the entire buffer one event at a time on the RT thread.
+    // 2× kMidiEventsPerSlot leaves headroom for normal mixed-in
+    // SysEx-among-CCs blocks while still bounding the worst case.
+    constexpr int kMaxScanIterations = 2 * (int)kMidiEventsPerSlot;
+    for (const auto meta : midi)
+    {
+        if (scanned >= kMaxScanIterations)
+        {
+            // Hit the per-block scan cap. Bulk-bump remaining and break;
+            // per-event accuracy past the cap is not a documented
+            // contract, the bound matters more on the audio thread.
+            bumpMidiOverflow((uint64_t)(totalEvents - scanned));
+            break;
+        }
+        ++scanned;
+        const auto& msg = meta.getMessage();
+        const int rawSize = msg.getRawDataSize();
+        if (rawSize <= 0 || rawSize > (int)kMidiEventMaxBytes)
+        {
+            // Doesn't fit (SysEx etc.). Audio thread never blocks; the
+            // lossy policy is documented in PR #2.
+            bumpMidiOverflow();
+            continue;
+        }
+        if (written >= kMidiEventsPerSlot)
+        {
+            // Bulk-bump for THIS event + every remaining event the
+            // iterator would visit, then break. Together with the
+            // scan-cap above, total audio-thread MIDI work is bounded
+            // at 2× kMidiEventsPerSlot iterations regardless of how
+            // bloated or pathological the inbound buffer is.
+            bumpMidiOverflow((uint64_t)(totalEvents - scanned + 1));
+            break;
+        }
+        // Reject events whose frame is past the truncated audio (samples
+        // ≤ numSamples — see the comment on the maxSamples computation
+        // above). Clamping would silently re-time the event into the
+        // audible portion, which is a worse failure mode than dropping it.
+        // samplePosition < 0 is an invalid input; treat it as out-of-range
+        // and drop too.
+        if (meta.samplePosition < 0 || meta.samplePosition >= samples)
+        {
+            bumpMidiOverflow();
+            continue;
+        }
+        auto& ev = queue.events[written];
+        ev.frame = (uint32_t)meta.samplePosition;
+        ev.size  = (uint32_t)rawSize;
+        std::memcpy(ev.bytes, msg.getRawData(), (size_t)rawSize);
+        ++written;
+    }
+    // Relaxed: the inWriteIdx release-store below synchronises this write
+    // with the sandbox's acquire-load of inWriteIdx in popInputBlock, so
+    // when the consumer observes the new write index it also observes
+    // count + events[].
+    atomicAt32(queue.count).store(written, std::memory_order_relaxed);
+
+    // 2. Copy audio into the same slot of the input ring.
+    auto bytesPerSlot = impl->header->ringBytesPerSlot;
+    auto* dst = impl->inputRing + slot * (bytesPerSlot / sizeof(float));
+    for (int ch = 0; ch < channels; ++ch)
+    {
+        auto* slotCh = dst + ch * maxSamples;
+        std::memcpy(slotCh, src.getReadPointer(ch),
+                    sizeof(float) * (size_t)samples);
+        if (samples < maxSamples)
+            std::memset(slotCh + samples, 0,
+                        sizeof(float) * (size_t)(maxSamples - samples));
+    }
+    for (int ch = channels; ch < maxCh; ++ch)
+        std::memset(dst + ch * maxSamples, 0,
+                    sizeof(float) * (size_t)maxSamples);
+
+    // 3. Publish the slot — release-synchronises with the consumer's acquire
+    //    on inWriteIdx in popInputBlock, which makes both the audio bytes
+    //    and the MIDI queue visible together.
+    writeIdx.store(w + 1, std::memory_order_release);
+    SetEvent(impl->evtToSandbox);
+    return true;
+}
+
+bool AudioChannel::popInputBlock(juce::AudioBuffer<float>& dst,
+                                 juce::MidiBuffer& midi,
+                                 int numSamples, int timeoutMs)
+{
+    // Inlined audio + MIDI drain so we hold the slot until both are read.
+    // Earlier this method delegated to popBlock(false, ...), which advanced
+    // inReadIdx before the MIDI was drained — the host could then immediately
+    // reuse the slot and overwrite the queue we were still reading.
+    if (!impl->header || !impl->midiQueues) return false;
+    // Symmetric with pushInputBlock: reject up front when the caller
+    // exceeds the spawn-time cap, so a misconfigured consumer learns
+    // about the misuse via the false return rather than getting silently
+    // truncated audio. Don't advance inReadIdx — the producer's slot
+    // stays full until the consumer corrects its numSamples (or the host
+    // tears down). Don't bump dropouts — caller misuse is its own class;
+    // see the matching comment in pushInputBlock.
+    //
+    // jassert + return false: today's only consumer (runAudioThread
+    // calls with currentBlockSize = jlimit(1, bufferCap, ...)) makes
+    // this branch unreachable; the assert flags any future caller that
+    // changes that.
+    jassert(numSamples <= (int)impl->header->maxBlockSamples);
+    if (numSamples > (int)impl->header->maxBlockSamples)
+        return false;
+
+    HANDLE evt = impl->evtToSandbox;
+    auto writeIdx = atomicAt(impl->header->inWriteIdx);
+    auto readIdx  = atomicAt(impl->header->inReadIdx);
+
+    // Same fast-path / wait / recheck pattern as popBlock: SetEvent on an
+    // auto-reset event collapses signals, so if pushInputBlock fires twice
+    // in a row we'd otherwise block on the second pop even though w > r.
+    uint64_t r = readIdx.load(std::memory_order_relaxed);
+    uint64_t w = writeIdx.load(std::memory_order_acquire);
+    if (w == r)
+    {
+        if (WaitForSingleObject(evt, timeoutMs) != WAIT_OBJECT_0)
+        {
+            atomicAt(impl->header->dropouts).fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        r = readIdx.load(std::memory_order_relaxed);
+        w = writeIdx.load(std::memory_order_acquire);
+        // Intentional non-data wake (AudioPauseGuard signalSandboxWake on
+        // every pause-guarded control op, kShutdown, disconnect). Same
+        // rationale as popBlock: don't count these as dropouts. Real
+        // missed-deadline events are caught by the timeout branch above
+        // and by SandboxedProcessor's pop-timeout call site.
+        if (w == r) return false;
+    }
+
+    const auto slot = r % impl->header->maxBlocks;
+
+    // 1. Drain MIDI from the slot. Relaxed-load on `count` is sufficient:
+    //    the synchronisation that publishes count + events[] is the
+    //    acquire-load on inWriteIdx above (paired with the producer's
+    //    release-store on inWriteIdx in pushInputBlock), and the producer
+    //    writes count itself with relaxed semantics. The acquire here
+    //    would be redundant overhead and slightly misleading about the
+    //    actual sync model.
+    auto& queue = impl->midiQueues[slot];
+    const uint32_t count = atomicAt32(queue.count)
+                                .load(std::memory_order_relaxed);
+    const uint32_t safeCount = juce::jmin(count, kMidiEventsPerSlot);
+    for (uint32_t i = 0; i < safeCount; ++i)
+    {
+        const auto& ev = queue.events[i];
+        const uint32_t size = juce::jmin(ev.size, kMidiEventMaxBytes);
+        if (size == 0) continue;
+        midi.addEvent(juce::MidiMessage(ev.bytes, (int)size),
+                      (int)ev.frame);
+    }
+
+    // 2. Copy audio out of the slot.
+    auto bytesPerSlot = impl->header->ringBytesPerSlot;
+    auto* src = impl->inputRing + slot * (bytesPerSlot / sizeof(float));
+    // numSamples ≤ maxSamples here (cap enforced by the early-return guard
+    // at the top of this function), so samples == numSamples and no
+    // tail-zero / one-shot warn is needed — both belonged to the old
+    // truncate-and-continue path.
+    const int maxSamples = (int)impl->header->maxBlockSamples;
+    const int dstCh      = dst.getNumChannels();
+    const int channels   = juce::jmin((int)impl->header->maxChannels, dstCh);
+    for (int ch = 0; ch < channels; ++ch)
+        std::memcpy(dst.getWritePointer(ch),
+                    src + ch * maxSamples,
+                    sizeof(float) * (size_t)numSamples);
+    for (int ch = channels; ch < dstCh; ++ch)
+        dst.clear(ch, 0, numSamples);
+
+    // 3. Release the slot — the host can now reuse it; we've finished both
+    //    audio and MIDI reads.
+    readIdx.store(r + 1, std::memory_order_release);
+    return true;
+}
+
+void AudioChannel::signalSandboxWake()
+{
+    // The `if (impl->evtToSandbox)` guard is non-atomic, so a concurrent
+    // close() racing this call could in principle observe a freed handle.
+    // Today's call paths (AudioPauseGuard ctor + dispatchRequest's
+    // kShutdown / disconnect callback) all run on the control thread, and
+    // close() runs on the WinMain thread only after audioThread.join() +
+    // control.stop() — both of which guarantee no in-flight signalSandboxWake
+    // can be racing. If a future caller invokes signalSandboxWake from a
+    // path that doesn't hold those teardown invariants, this guard needs
+    // upgrading (e.g. an atomic<HANDLE> swapped to nullptr by close()
+    // before CloseHandle, with the SetEvent guarded by the swap result).
+    if (impl->evtToSandbox) SetEvent(impl->evtToSandbox);
 }
 
 } // namespace slopsmith::sandbox

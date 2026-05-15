@@ -18,6 +18,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <cstdarg>
@@ -45,6 +46,13 @@
 #include "../audio/VSTTrace.h"
 
 using namespace slopsmith::sandbox;
+
+// Forward decl so the dispatchRequest anonymous-namespace block can log; the
+// real definition lives at the bottom of the file with the FILE* it owns.
+// `static` (TU-local) is intentional — keep the declaration AND the
+// definition in sync if hostLogf ever gets pulled into a separate header
+// (drop both `static` qualifiers, then declare in the header instead).
+static void hostLogf(const char* fmt, ...);
 
 namespace {
 
@@ -228,6 +236,13 @@ public:
 // Single-plugin host state, owned by the main thread; the worker thread reads
 // pointers via std::atomic-like volatile reads (the plugin pointer is set
 // before threads start and cleared on shutdown).
+//
+// Audio-thread sync (v2 / PR #2): non-realtime control ops that mutate plugin
+// or buffer state (kPrepare, kSetBlockSize, kGetState, kSetState) acquire an
+// AudioPauseGuard which sets `audioPauseRequested`, signals the audio worker
+// out of its popInputBlock wait, waits on `audioPausedAck`, then performs the
+// op exclusively. The guard's destructor signals `audioResume` and the worker
+// re-syncs blockSize before resuming.
 struct HostState
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
@@ -244,9 +259,151 @@ struct HostState
     // etc.) could race two async lambdas on st.editor / st.editorWindow.
     std::atomic<bool> editorRequestInFlight{false};
     std::thread audioThread;
-    int sampleRate = 48000;
-    int blockSize  = 256;
-    int channels   = 2;
+    std::atomic<int> sampleRate{48000};
+    std::atomic<int> blockSize{256};
+    int channels = 2;                   // const after argv parse — main thread only
+
+    std::atomic<bool>    audioPauseRequested{false};
+    juce::WaitableEvent  audioPausedAck;    // audio thread → control thread
+    juce::WaitableEvent  audioResume;       // control thread → audio thread
+    // ^ Both default-constructed = auto-reset (manualReset=false), so a
+    //   successful wait() clears the signaled state on the waiter side; no
+    //   explicit reset() needed. The pause-loop in runAudioThread + the
+    //   defensive resume signal in AudioPauseGuard's bail path both rely on
+    //   this — manualReset=true would require explicit resets and break the
+    //   self-recovery story.
+
+    // Set by kPrepare on success. Gates two things:
+    //   1. the audio worker's pop→processBlock loop — JUCE's contract is that
+    //      processBlock must not be called before prepareToPlay, and the
+    //      worker now starts BEFORE control.start so the spawn-to-first-
+    //      kPrepare window is real.
+    //   2. kSetBlockSize — the cached `sampleRate` defaults to 48000 at
+    //      spawn; if a host calls kSetBlockSize before kPrepare, prepareToPlay
+    //      would silently run at the wrong rate. Better to reject loudly.
+    std::atomic<bool> prepared{false};
+};
+
+// RAII pause/drain/resume around non-realtime ops. Construct on the control
+// (message) thread before touching plugin or blockSize state; destruct after.
+struct AudioPauseGuard
+{
+    HostState& st;
+    bool       active = false;
+    explicit AudioPauseGuard(HostState& s) : st(s)
+    {
+        // Short-circuit if the worker is already shutting down so we don't
+        // wait on an ack that won't come. Leaves active=false; callers MUST
+        // check that before mutating plugin state.
+        if (!st.running.load(std::memory_order_acquire))
+            return;
+        st.audioPauseRequested.store(true, std::memory_order_release);
+        // Wake the audio thread out of popInputBlock so it notices the pause
+        // flag without waiting the full 200 ms timeout.
+        st.audio.signalSandboxWake();
+        // Poll the ack on a 50 ms cadence rather than wait(-1), so that if
+        // the worker exits between our `running` check and this wait (or if
+        // a back-to-back pause guard already consumed the worker's
+        // exit-time signal), we still notice and bail without deadlocking.
+        // The `running` check happens BEFORE each wait, not after — that
+        // way a back-to-back guard at shutdown observes running=false and
+        // bails on the first iteration instead of paying the 50ms wait
+        // before noticing. Worst-case latency is one 50ms slice (the
+        // window where running flips between our check and wait return),
+        // bounded by the acquire-load semantic.
+        // No upper bound on total wait — a heavy plugin's processBlock can
+        // legitimately run for tens of ms — but log at escalating thresholds
+        // so a future "control op feels stuck" investigation has trail of
+        // breadcrumbs (not just the first 250 ms data point).
+        const auto waitStart = std::chrono::steady_clock::now();
+        long long nextWarnMs = 250;        // 250ms → 1s → 5s → 30s → ...
+        bool everWarned = false;
+        while (true)
+        {
+            if (!st.running.load(std::memory_order_acquire))
+            {
+                // Bail-out path: the worker may already be in (or about to
+                // enter) its pause branch. Clear the flag and signal resume
+                // defensively so the worker doesn't block on
+                // audioResume.wait(...) indefinitely after we leave; the
+                // worker's bounded wait + running re-check is the
+                // self-recovery belt, this is the suspenders.
+                st.audioPauseRequested.store(false, std::memory_order_release);
+                st.audioResume.signal();
+                return;  // active=false → dtor is a no-op, callers skip mutation
+            }
+            if (st.audioPausedAck.wait(50)) break;
+            using namespace std::chrono;
+            const long long elapsedMs = duration_cast<milliseconds>(
+                steady_clock::now() - waitStart).count();
+            // Single-step advance per wait tick. Using `while` here would
+            // emit multiple back-to-back log lines reporting the SAME
+            // elapsedMs value if a long stall (OS hiccup, debugger pause)
+            // jumped past several thresholds at once — partly defeating the
+            // backoff. Stepping one threshold per outer iteration means the
+            // worst case is a few extra wait-ticks before catching up,
+            // which is the right trade.
+            if (elapsedMs >= nextWarnMs)
+            {
+                hostLogf("AudioPauseGuard: ack still pending after %lld ms"
+                         " — heavy processBlock or stuck worker?", elapsedMs);
+                everWarned = true;
+                // Geometric backoff so a multi-second stall doesn't spam
+                // the log. Actual sequence with the multiplier-by-10 past
+                // 30s: 250ms → 1s → 5s → 30s → 5min → 50min → ~8h → ...
+                if      (nextWarnMs < 1000)    nextWarnMs = 1000;
+                else if (nextWarnMs < 5000)    nextWarnMs = 5000;
+                else if (nextWarnMs < 30000)   nextWarnMs = 30000;
+                else                           nextWarnMs *= 10;
+            }
+        }
+        if (everWarned)
+        {
+            // Final elapsed so the operator sees the actual stall length
+            // instead of just the last "after Nms" line.
+            using namespace std::chrono;
+            const long long totalMs = duration_cast<milliseconds>(
+                steady_clock::now() - waitStart).count();
+            hostLogf("AudioPauseGuard: ack received after %lld ms total",
+                     totalMs);
+        }
+        // Re-check running AFTER the ack succeeds. If `running` flipped to
+        // false during the wait (worker exited, signaled audioPausedAck on
+        // its way out per the runAudioThread bottom), the ack we just
+        // consumed is a stale exit-time signal — the worker is gone, not
+        // paused. Mutating plugin state would still be safe (no concurrent
+        // processBlock) but `active=true` would misleadingly tell callers
+        // the worker is alive. Treat as bail; signal resume defensively.
+        if (!st.running.load(std::memory_order_acquire))
+        {
+            st.audioPauseRequested.store(false, std::memory_order_release);
+            st.audioResume.signal();
+            return;
+        }
+        active = true;
+        // Synchronisation invariant: this constructor + the destructor
+        // each clear `audioPauseRequested` exactly once and signal
+        // `audioResume` once. The two-level loop in runAudioThread (outer
+        // `while (running)` + inner `while (audioPauseRequested && running)`)
+        // tolerates that pattern because the inner loop's `ackedThisPause`
+        // flag re-acks on every fresh request — a back-to-back guard B
+        // arriving while the worker is still in the inner loop just sets
+        // the flag back to true, and the worker re-acks on the next pass.
+        // The two transient flag flips on the control thread and the
+        // worker's two-level loop synchronise correctly only because the
+        // control I/O thread serialises dispatches today (no two guards
+        // ever race). A future parallel-dispatch refactor would need to
+        // serialise pause-guarded ops some other way (a control-thread
+        // mutex, request batching, etc.) before this assumption holds.
+    }
+    ~AudioPauseGuard()
+    {
+        if (!active) return;
+        st.audioPauseRequested.store(false, std::memory_order_release);
+        st.audioResume.signal();
+    }
+    AudioPauseGuard(const AudioPauseGuard&) = delete;
+    AudioPauseGuard& operator=(const AudioPauseGuard&) = delete;
 };
 
 juce::var pluginMetadata(juce::AudioPluginInstance& p)
@@ -338,21 +495,102 @@ inline void teardownGuiOnMessageThread(HostState& st, bool postQuit)
 
 void runAudioThread(HostState& st)
 {
-    juce::AudioBuffer<float> buffer(st.channels, st.blockSize);
-    // `midi` stays empty in v1 — MIDI is moving to an inline per-block shm
-    // queue in the audio-shm follow-up PR. The control-channel op::kMidiEvent
-    // path is a no-op deprecation stub; nothing populates this buffer today.
+    // Allocate at the spawn-time cap so the working buffer's storage is sized
+    // for the largest blockSize the protocol allows. setSize(.., avoidRealloc)
+    // on resume retargets to the current per-call size without a malloc.
+    //
+    // The realloc-free guarantee on resume relies on currentBlockSize <=
+    // bufferCap so subsequent setSize(..) calls (kPrepare / kSetBlockSize
+    // widening blockSize up to spawnCap) stay within the initial allocation.
+    // This invariant holds because spawn-time blockSize is clamped to
+    // kAudioMaxBlockSamples in SandboxFactory_win::tryLoadSandboxed and
+    // bufferCap == st.audio.dims().maxBlockSamples == that same cap. The
+    // jmax() below is a belt-and-braces guard for the case where some future
+    // spawn path lets the initial blockSize exceed bufferCap; the jassert
+    // makes the invariant explicit.
+    const int bufferCap   = (int)st.audio.dims().maxBlockSamples;
+    int currentBlockSize  = st.blockSize.load(std::memory_order_acquire);
+    jassert(currentBlockSize <= bufferCap);
+    juce::AudioBuffer<float> buffer(st.channels, juce::jmax(bufferCap,
+                                                            currentBlockSize));
+    buffer.setSize(st.channels, currentBlockSize,
+                   /*keep*/false, /*clear*/true, /*avoidRealloc*/true);
     juce::MidiBuffer midi;
     while (st.running.load(std::memory_order_acquire))
     {
-        if (!st.audio.popBlock(/*isOutputRing=*/false, buffer, st.blockSize,
-                               /*timeoutMs=*/200))
+        if (st.audioPauseRequested.load(std::memory_order_acquire))
+        {
+            // Bounded wait + re-check loop, not wait(-1), so we self-recover
+            // if the matching AudioPauseGuard never gets to its destructor:
+            //   - shutdown bail (running flips false in the constructor's
+            //     poll loop) — guard now defensively signals resume + clears
+            //     the request, but this loop is the safety net in case any
+            //     future caller construction path forgets to.
+            //   - exception/early return between guard ctor and dtor.
+            // Auto-reset WaitableEvent (default ctor) clears on successful
+            // wait(), so we don't need an explicit reset() — that
+            // assumption is documented at the audioResume field too.
+            //
+            // CRITICAL: re-ack on every pause cycle, not just once at entry.
+            // If guard A's destructor clears pauseRequested + signals
+            // resume, and guard B sets pauseRequested true *before* the
+            // worker exits this branch, the worker stays in the loop
+            // (pauseRequested still true) but never sends a fresh ack —
+            // guard B would wait forever. `ackedThisPause` is reset
+            // whenever resume fires so the next iteration re-acks.
+            bool ackedThisPause = false;
+            while (st.audioPauseRequested.load(std::memory_order_acquire)
+                   && st.running.load(std::memory_order_acquire))
+            {
+                if (!ackedThisPause)
+                {
+                    st.audioPausedAck.signal();
+                    ackedThisPause = true;
+                }
+                if (st.audioResume.wait(50))
+                {
+                    // Resume signaled. The next loop iteration re-checks
+                    // pauseRequested; if a new guard already flipped it
+                    // back to true, force a fresh ack on that pass.
+                    ackedThisPause = false;
+                }
+            }
+            // Re-sync block size in case the control op widened it.
+            const int bs = juce::jlimit(1, bufferCap,
+                                        st.blockSize.load(std::memory_order_acquire));
+            if (bs != currentBlockSize)
+            {
+                buffer.setSize(st.channels, bs,
+                               /*keep*/false, /*clear*/true, /*avoidRealloc*/true);
+                currentBlockSize = bs;
+            }
             continue;
+        }
+        midi.clear();
+        if (!st.audio.popInputBlock(buffer, midi, currentBlockSize, /*timeoutMs=*/200))
+            continue;
+        // JUCE contract: processBlock must not be called before prepareToPlay.
+        // The worker now starts BEFORE control.start (so pause-guarded ops
+        // always have an acker), so the spawn-to-first-kPrepare window is
+        // real. If a host pushes audio before kPrepare returns, push a
+        // zero-output block (so the output ring stays in lockstep with the
+        // input ring; otherwise the host's popBlock(true,…) times out and
+        // bumps `dropouts` for every pre-prepare block, polluting the
+        // metric). acquire-load pairs with kPrepare's release-store.
+        if (!st.prepared.load(std::memory_order_acquire))
+        {
+            buffer.clear();
+            st.audio.pushBlock(/*isOutputRing=*/true, buffer, currentBlockSize);
+            continue;
+        }
         if (auto* p = st.plugin.get())
             p->processBlock(buffer, midi);
-        st.audio.pushBlock(/*isOutputRing=*/true, buffer, st.blockSize);
-        midi.clear();
+        st.audio.pushBlock(/*isOutputRing=*/true, buffer, currentBlockSize);
     }
+    // Defensive: any control-thread AudioPauseGuard waiting on us at the time
+    // of shutdown must not deadlock. Signaling here is harmless if no one's
+    // waiting — the event is auto-reset and absorbed by the next wait.
+    st.audioPausedAck.signal();
 }
 
 void dispatchRequest(HostState& st, int requestId, const juce::String& op,
@@ -368,14 +606,38 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
 
     if (op == op::kPrepare)
     {
+        // Require a loaded plugin so a misordered host call (kPrepare before
+        // anything is loaded) is loud rather than a silent ok with skipped
+        // prepareToPlay. Mirrors the no-plugin guards in kSetBlockSize /
+        // kSetState / kSetParameter.
+        //
+        // Today this branch is unreachable: WinMain runs loadPlugin BEFORE
+        // control.start, and dispatchRequest only fires after the I/O
+        // thread is alive. The "no plugin loaded" wording is the same as
+        // the other ops for consistency; the more accurate description for
+        // a future-reachable path would be "loadPlugin failed before
+        // kPrepare". If a future code path detaches plugin loading from
+        // spawn (e.g. lazy-load on first kPrepare), revisit the message.
+        if (!st.plugin)
+        {
+            reply(false, {}, "no plugin loaded");
+            return;
+        }
         // Both sr and bs come from JSON-deserialised juce::var — could be
         // double NaN, ±inf, or out-of-int-range. Read as double first and
         // validate finiteness + range BEFORE the narrowing int cast.
         // (int)NaN and (int)<INT_MIN-or->INT_MAX double are UB per C++.
         // Mirrors the validation in SandboxFactory_win::createSandboxed
         // at spawn time.
+        //
+        // Cap blockSize at the SPAWN-TIME ring size, not the protocol max:
+        // the audio shm and the worker's pre-allocated buffer were sized to
+        // dims().maxBlockSamples at spawn. Anything larger would silently
+        // truncate inside push/popInputBlock and the sandbox would process
+        // shorter blocks than the host pushed.
         double sr  = (double)args.getProperty("sampleRate", 48000);
         double bsd = (double)args.getProperty("blockSize",  256);
+        const int spawnCap = (int)st.audio.dims().maxBlockSamples;
         if (! std::isfinite(sr)
             || sr <= 0.0
             || sr > (double)(std::numeric_limits<int>::max)()
@@ -383,27 +645,129 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
             || ! std::isfinite(bsd)
             || bsd <= 0.0
             || std::floor(bsd) != bsd  // reject fractional: 256.5 → 256 silently changes effective size
-            || bsd > (double)kAudioMaxBlockSamples)
+            || bsd > (double)spawnCap)
         {
             reply(false, {}, "invalid prepare args: sr=" + juce::String(sr)
-                             + " bs=" + juce::String(bsd));
+                             + " bs=" + juce::String(bsd)
+                             + " (spawnCap=" + juce::String(spawnCap) + ")");
             return;
         }
         const int bs = (int)bsd;
-        st.sampleRate = (int)sr;
-        st.blockSize  = bs;
-        if (st.plugin)
+        // Pause the audio worker before mutating shared blockSize / calling
+        // prepareToPlay — otherwise processBlock can race the reconfigure.
+        AudioPauseGuard pause(st);
+        if (!pause.active)
         {
-            st.plugin->setNonRealtime(false);
-            st.plugin->prepareToPlay(sr, bs);
+            // Worker is shutting down (or shut down). Don't mutate plugin
+            // state without exclusive access — a final processBlock could
+            // still be in flight on the audio thread between running.store
+            // (false) and audioThread.join().
+            reply(false, {}, "audio worker not paused (shutting down)");
+            return;
         }
+        // Make the "worker never sees `prepared=true` while plugin is
+        // half-configured" invariant load-bearing rather than implicit:
+        // explicitly clear `prepared` while we're holding the pause guard,
+        // then republish after prepareToPlay returns. Today the worker is
+        // paused throughout the reconfigure window so it never reads the
+        // stale-true value, but a future code path that mutates plugin
+        // state without holding the guard would otherwise be at risk.
+        st.prepared.store(false, std::memory_order_release);
+        st.sampleRate.store((int)sr, std::memory_order_release);
+        st.blockSize.store(bs,       std::memory_order_release);
+        st.plugin->setNonRealtime(false);
+        // Caller contract: JUCE plugins must not throw from prepareToPlay
+        // (the AudioProcessor base spec is noexcept-by-convention; a
+        // throwing plugin is a bug). If a future plugin ever does throw,
+        // this would propagate up the dispatch stack and `prepared` would
+        // remain false, so the worker stays gated and no half-configured
+        // processBlock fires. Acceptable failure mode; document but don't
+        // wrap in try/catch (which would mask the bug).
+        st.plugin->prepareToPlay(sr, bs);
+        // Read latencySamples while still inside the pause window — some
+        // plugins recompute it inside prepareToPlay AND mutate it from
+        // their processBlock hot path; reading before `prepared=true` (so
+        // the worker can't yet enter processBlock) is the strict-safe
+        // ordering. JUCE's getter is generally thread-safe, but we have
+        // exclusive access here regardless.
+        const int latency = st.plugin->getLatencySamples();
+        // Order matters: republish `prepared=true` AFTER prepareToPlay
+        // returns so the audio worker (which gates on `prepared`) never
+        // sees the flag before the plugin is actually ready. release-store
+        // pairs with the worker's acquire-load.
+        st.prepared.store(true, std::memory_order_release);
         // `ok` is already on the envelope via wire::makeReply — keeping it
         // off the result object so the schema stays uniform across ops
         // (kOpenEditor/kGetState/etc. don't double up either).
         juce::DynamicObject::Ptr res(new juce::DynamicObject());
-        res->setProperty("latencySamples",
-            st.plugin ? st.plugin->getLatencySamples() : 0);
+        res->setProperty("latencySamples", latency);
         reply(true, juce::var(res.get()));
+    }
+    else if (op == op::kSetBlockSize)
+    {
+        // Require a loaded AND prepared plugin: kSetBlockSize calls
+        // prepareToPlay using the cached `sampleRate`, which defaults to
+        // 48000 at spawn. A kSetBlockSize before kPrepare with a loaded
+        // plugin would silently prepare at the wrong rate. Mirrors the
+        // no-plugin guards on kSetState / kSetParameter and adds the
+        // not-prepared guard for the cached-rate hazard.
+        if (!st.plugin)
+        {
+            reply(false, {}, "no plugin loaded");
+            return;
+        }
+        if (!st.prepared.load(std::memory_order_acquire))
+        {
+            // `prepared=false` here means either kPrepare was never called
+            // OR we're inside the brief window between prepared.store(false)
+            // and prepared.store(true) of an in-flight kPrepare /
+            // kSetBlockSize. Today the control I/O thread serialises
+            // dispatches so the in-flight window is unreachable from this
+            // dispatch — but using "plugin not prepared" rather than
+            // "prepare not called" keeps the message accurate in both
+            // regimes if a future dispatch model parallelises requests.
+            reply(false, {}, "plugin not prepared");
+            return;
+        }
+        // Read as double first then narrow — JSON-deserialised juce::var could
+        // be NaN/±inf/out-of-int-range; (int)NaN and out-of-range double cast
+        // are UB. Same pattern as kPrepare / kSetParameter.
+        // Same cap rationale as kPrepare: the spawn-time ring size is the
+        // hard limit, not kAudioMaxBlockSamples.
+        const double bsd = (double)args.getProperty("blockSize", 0);
+        const int spawnCap = (int)st.audio.dims().maxBlockSamples;
+        if (! std::isfinite(bsd)
+            || bsd <= 0.0
+            || std::floor(bsd) != bsd  // reject fractional: 256.5 → 256 silently changes effective size
+            || bsd > (double)spawnCap)
+        {
+            reply(false, {}, "invalid setBlockSize: bs=" + juce::String(bsd)
+                             + " (spawnCap=" + juce::String(spawnCap) + ")");
+            return;
+        }
+        const int bs = (int)bsd;
+        AudioPauseGuard pause(st);
+        if (!pause.active)
+        {
+            reply(false, {}, "audio worker not paused (shutting down)");
+            return;
+        }
+        // Same load-bearing-invariant pattern as kPrepare: clear `prepared`
+        // under the pause guard, do the reconfigure, republish.
+        st.prepared.store(false, std::memory_order_release);
+        st.blockSize.store(bs, std::memory_order_release);
+        // Mirror kPrepare's pre-amble so block-size changes don't subtly
+        // differ from full prepares for plugins that key off
+        // setNonRealtime (e.g. some sample-streamers gate background loads
+        // behind it). prepareToPlay then rebuilds JUCE's processing
+        // pipeline at the new block size — cheap for most plugins and the
+        // only universally supported way to change buffer size in the
+        // JUCE wrapper.
+        st.plugin->setNonRealtime(false);
+        st.plugin->prepareToPlay((double)st.sampleRate.load(std::memory_order_acquire),
+                                 bs);
+        st.prepared.store(true, std::memory_order_release);
+        reply(true, {});
     }
     else if (op == op::kOpenEditor)
     {
@@ -500,7 +864,28 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
     else if (op == op::kGetState)
     {
         juce::MemoryBlock mb;
-        if (st.plugin) st.plugin->getStateInformation(mb);
+        // get/setStateInformation can mutate plugin internals (presets,
+        // parameter trees, plugin-internal allocations). Pause the audio
+        // worker to avoid racing processBlock against the plugin's state
+        // serialisation.
+        //
+        // Shutdown semantics: if the worker has already exited, we reject
+        // with "shutting down" rather than running getStateInformation
+        // unguarded. That IS a behavior change from pre-v3 (where
+        // kGetState was best-effort callable any time); a host needing
+        // last-moment crash-recovery state must kGetState BEFORE
+        // initiating shutdown. The trade-off is intentional — racing a
+        // final processBlock at shutdown to grab state is exactly the
+        // class of UB this guard was added to prevent.
+        {
+            AudioPauseGuard pause(st);
+            if (!pause.active)
+            {
+                reply(false, {}, "audio worker not paused (shutting down)");
+                return;
+            }
+            if (st.plugin) st.plugin->getStateInformation(mb);
+        }
         juce::DynamicObject::Ptr res(new juce::DynamicObject());
         res->setProperty("stateBase64",
             juce::Base64::toBase64(mb.getData(), mb.getSize()));
@@ -518,6 +903,12 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
         if (!st.plugin)
         {
             reply(false, {}, "no plugin loaded");
+            return;
+        }
+        AudioPauseGuard pause(st);
+        if (!pause.active)
+        {
+            reply(false, {}, "audio worker not paused (shutting down)");
             return;
         }
         st.plugin->setStateInformation(mo.getData(), (int)mo.getDataSize());
@@ -567,11 +958,28 @@ void dispatchRequest(HostState& st, int requestId, const juce::String& op,
         // Plugin destruction stays in WinMain post-audioThread.join() (audio
         // thread can be between its running.load() check and processBlock —
         // dropping plugin would dereference a freed AudioPluginInstance).
+        // teardownGuiOnMessageThread sets running=false and posts WM_QUIT.
         teardownGuiOnMessageThread(st, /*postQuit=*/true);
+        // Wake the audio worker so it observes running=false within one
+        // popInputBlock turn instead of waiting up to 200 ms; the worker
+        // signals audioPausedAck on the way out so a stale guard wait
+        // (race window during shutdown) can't deadlock.
+        st.audio.signalSandboxWake();
     }
     else if (op == op::kMidiEvent)
     {
-        // Fire-and-forget — but no-op for now. Bundled MIDI is a follow-up.
+        // Removed since protocol v2: MIDI is now bundled inline in the audio
+        // shm's per-slot MidiQueue. The version handshake (now v3) rejects
+        // any v1 host before it can reach this path, so this branch is a
+        // paranoid fallback. Drop it when v1 host binaries are no longer
+        // in circulation.
+        static std::atomic<bool> warned{false};
+        bool expected = false;
+        if (warned.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel))
+            hostLogf("warn: control-pipe op::kMidiEvent is removed since "
+                     "protocol v2 — host is sending MIDI on the wrong channel");
+        // Fire-and-forget; deliberately no reply.
     }
     else
     {
@@ -821,6 +1229,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         {
             dispatchRequest(st, id, op, args);
         });
+    // Start the audio thread BEFORE control.start so that any pause-guarded
+    // request (kPrepare, kSetBlockSize, kGetState, kSetState) dispatched on
+    // the control I/O thread always has a worker to ack the pause flag —
+    // otherwise an early kPrepare would deadlock in AudioPauseGuard waiting
+    // forever on audioPausedAck.
+    st.audioThread = std::thread([&st] { runAudioThread(st); });
+
+    auto stopAudioWorker = [&st]
+    {
+        st.running.store(false, std::memory_order_release);
+        // Wake the worker out of popInputBlock so it observes running=false
+        // promptly; the worker also signals audioPausedAck on its way out.
+        st.audio.signalSandboxWake();
+        if (st.audioThread.joinable()) st.audioThread.join();
+    };
+
     if (!st.control.start({}, [&st](const juce::String&)
     {
         // Pipe dropped → mirror the kShutdown GUI teardown. postQuit=true
@@ -829,12 +1253,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         // 20ms runDispatchLoopUntil tick if the loop happens to be inside
         // it when the disconnect fires.
         teardownGuiOnMessageThread(st, /*postQuit=*/true);
+        // Wake the audio worker so it observes running=false within one
+        // popInputBlock turn instead of waiting up to 200 ms; the worker
+        // signals audioPausedAck on the way out so a stale guard wait
+        // (race window during shutdown) can't deadlock.
+        st.audio.signalSandboxWake();
     }))
     {
         hostLogf("control channel start failed: %s",
                  st.control.getLastStartError().toRawUTF8());
+        // Audio worker was started before control.start (so pause-guarded
+        // ops always have an acker); on this failure path it's still
+        // running and must be stopped before we exit.
+        stopAudioWorker();
         // Same fast-fail signal as the loadPlugin failure path: best-effort
         // goodbye so the host doesn't burn its 30s handshake timeout.
+        // Safe even after start() failure — connectClientSide opened the
+        // pipe earlier in WinMain and start() only spins up the I/O
+        // thread, so the underlying handle is valid; ControlChannel::
+        // writeFrame is mutex-guarded and short-circuits on
+        // INVALID_HANDLE_VALUE so the worst case is a false return.
         st.control.sendEvent(event::kGoodbye, {});
         return 6;
     }
@@ -844,11 +1282,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     {
         hostLogf("failed to send ready event — host won't see us as ready");
         st.control.stop();
+        stopAudioWorker();
         return 7;
     }
     hostLogf("ready event sent");
-
-    st.audioThread = std::thread([&st] { runAudioThread(st); });
 
     // Pump the main message loop. JUCE's MessageManager is bound to this
     // thread (the OS main thread), which is the key correctness property
