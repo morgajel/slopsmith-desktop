@@ -395,8 +395,11 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Round-trip through the clamped dB value so the engine sees the same gain
         // the slider shows — prevents out-of-range preset values from bypassing the
         // [-60, +12] dB clamp applied by linearGainToDb/dbToLinearGain.
+        // Output gain routes to 'chain' (guitar-only, applied before the
+        // backing track is mixed) so a tone-preset switch changes the amp
+        // level without moving the song volume.
         api.setGain('input', dbToLinearGain(inDbR));
-        api.setGain('output', dbToLinearGain(outDbR));
+        api.setGain('chain', dbToLinearGain(outDbR));
     }
 
     // ── Device Types ──────────────────────────────────────────────────────────
@@ -661,7 +664,8 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
 
         outputGainSlider.addEventListener('input', () => {
             const db = parseFloat(outputGainSlider.value);
-            api.setGain('output', dbToLinearGain(db));
+            // 'chain' = guitar-only amp output (see applyPresetGainLevels).
+            api.setGain('chain', dbToLinearGain(db));
             outputGainLabel.textContent = formatGainDbLabel(db);
         });
 
@@ -2566,6 +2570,10 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     if (!origPS) return;
 
     let _lastTone = null;
+    // Throttle the "_toneSwitcher not ready" warning — the tone monitor polls
+    // at 50ms, so without this it would log every tick while the switcher is
+    // unavailable. Logged once per not-ready episode; reset on a successful switch.
+    let _toneSwitcherWarned = false;
     /** Song + arrangement — invalidates preload when switching Lead/Bass/etc. on the same file */
     let _preloadedToneCacheKey = null;
 
@@ -2602,7 +2610,9 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         // Fallback when first IIFE hasn't loaded yet (should not happen in normal flow).
         const inputLin = Number.isFinite(Number(preset?.inputGain)) ? Number(preset.inputGain) : 1;
         const outputLin = Number.isFinite(Number(preset?.outputGain)) ? Number(preset.outputGain) : 1;
-        if (_api?.setGain) { _api.setGain('input', inputLin); _api.setGain('output', outputLin); }
+        // Output gain → 'chain' (guitar-only) so a preset switch doesn't move
+        // the song volume — consistent with the first IIFE's applyPresetGainLevels.
+        if (_api?.setGain) { _api.setGain('input', inputLin); _api.setGain('chain', outputLin); }
     }
 
     function applyPresetNoiseGate(_api, preset) {
@@ -2626,6 +2636,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
     function startToneAutoSwitch() {
         if (hookState.toneAutoMonitor) clearInterval(hookState.toneAutoMonitor);
         _lastTone = null;
+        _toneSwitcherWarned = false;  // fresh not-ready warning per monitor session
         window._toneAutoSwitchActive = true;
 
         hookState.toneAutoMonitor = setInterval(() => {
@@ -2655,14 +2666,20 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
             }
 
             if (activeTone && activeTone !== _lastTone) {
-                _lastTone = activeTone;
-                showToneToast(activeTone);
-
-                // Trigger preset switch if ToneSwitcher is available
+                // Only mark the tone consumed once it is actually applied.
+                // Updating _lastTone before the _toneSwitcher null-check would
+                // permanently drop a switch that arrives during the startup
+                // window before _toneSwitcher is installed — the next 50 ms
+                // poll would see activeTone === _lastTone and skip it.
                 if (window._toneSwitcher) {
+                    _lastTone = activeTone;
+                    showToneToast(activeTone);
                     window._toneSwitcher.switchToTone(activeTone);
-                } else {
-                    console.log('[tone-switcher] WARNING: _toneSwitcher is null at switch time');
+                    _toneSwitcherWarned = false;
+                } else if (!_toneSwitcherWarned) {
+                    // Throttled: log once, not every 50ms poll.
+                    _toneSwitcherWarned = true;
+                    console.log('[tone-switcher] _toneSwitcher not ready — retrying until installed');
                 }
             }
         }, 50);
@@ -2675,6 +2692,7 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
         window._aeDidClearChainForNewSong = false;
         window._aeClearingChainForNewSong = false;
         _lastTone = null;
+        _toneSwitcherWarned = false;
         window._aeTaSessionOverrides = {};
         if (window._closeChainPanel) window._closeChainPanel();
         window._currentSongFile = decodeURIComponent(filename);
