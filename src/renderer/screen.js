@@ -3026,13 +3026,48 @@ window.__slopsmithDesktopAudioHooks = window.__slopsmithDesktopAudioHooks || {};
                     if (!presetName || !presets[presetName]) continue;
                     const preset = presets[presetName];
                     const slotIds = [];
-                    const chainItems = Array.isArray(preset?.items) ? preset.items : [];
-                    for (const item of chainItems) {
+                    const chainItems = getPresetItems(preset);
+                    // Per-slot processor state lives only in the native preset
+                    // blob (savePreset's chain[].state), parallel to `items`.
+                    // NAM/IR are fully defined by their path; a VST also needs
+                    // its getStateInformation() blob (params + loaded model)
+                    // re-applied — loadVST() alone brings it up blank.
+                    let nativeChain = [];
+                    try {
+                        const parsed = JSON.parse(preset.nativePreset || '{}').chain;
+                        if (Array.isArray(parsed)) nativeChain = parsed;
+                    } catch (_) { nativeChain = []; }
+                    for (let ci = 0; ci < chainItems.length; ci++) {
+                        const item = chainItems[ci];
                         let slotId = -1;
                         if (item.type === 'NAM' && item.path) slotId = await api.loadNAMModel(item.path);
                         else if (item.type === 'IR' && item.path) slotId = await api.loadIR(item.path);
                         else if (item.type === 'VST' && item.path) slotId = await api.loadVST(item.path);
-                        if (slotId >= 0) slotIds.push(slotId);
+                        if (slotId >= 0) {
+                            slotIds.push(slotId);
+                            // Only apply the parallel native-chain entry when it
+                            // exists, is a VST, and refers to the same plugin
+                            // (path match) — guards against items/nativePreset
+                            // blob drift applying a wrong state blob to a
+                            // mismatched slot even when both positions are VSTs.
+                            const nativeEntry = nativeChain[ci];
+                            const entryAligned = nativeEntry
+                                && Number(nativeEntry.type) === 0 // 0 = VST
+                                && (!nativeEntry.path || !item.path
+                                    || nativeEntry.path === item.path);
+                            const st = entryAligned && nativeEntry.state;
+                            if (item.type === 'VST' && st) {
+                                try {
+                                    // Return value is a feature-detect signal
+                                    // (addon supports the call), not proof the
+                                    // blob decoded/applied cleanly.
+                                    const supported = await api.setSlotState(slotId, st);
+                                    if (supported === false) {
+                                        console.warn('[tone-switcher] setSlotState unsupported by native addon');
+                                    }
+                                } catch (e) { console.warn('[tone-switcher] setSlotState failed:', e); }
+                            }
+                        }
                     }
                     toneSlotMap[toneName] = slotIds;
                     tonePresetMap[toneName] = preset;

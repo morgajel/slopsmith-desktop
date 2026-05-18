@@ -419,6 +419,25 @@ export function initAudioBridge(): void {
         audio?.setParameter(slotId, paramIndex, value);
     });
 
+    ipcMain.handle('audio:setSlotState', (_event, slotId: number, base64State: string): boolean => {
+        // typeof-guarded so a downlevel addon is a no-op rather than a thrown
+        // IPC error (Constitution VII fail-soft). Returns true when the native
+        // addon supports the call (feature-detect signal — the preload always
+        // exposes the method, so a renderer-side typeof check cannot tell a
+        // downlevel addon apart). try/catch so an addon-side throw resolves
+        // to false rather than rejecting the renderer's ipcRenderer.invoke.
+        if (audio && typeof audio.setSlotState === 'function') {
+            try {
+                audio.setSlotState(slotId, base64State);
+                return true;
+            } catch (err) {
+                console.warn('[audio-bridge] setSlotState threw:', err);
+                return false;
+            }
+        }
+        return false;
+    });
+
     // ── MIDI ───────────────────────────────────────────────────────────────
 
     ipcMain.handle('audio:sendMidiToSlot', (_event, slotId: number, msgType: number, channel: number, param1: number, param2?: number) => {
