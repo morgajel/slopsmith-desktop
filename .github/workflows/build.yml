@@ -26,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -34,7 +34,9 @@ jobs:
       - name: Read build configuration
         id: config
         shell: bash
-        run: |
+        # NOTE: presuming your using VS Code, install https://marketplace.visualstudio.com/items?itemName=WondaCorp.yaml-code-injection-highlight
+        # and yo'll get much better syntax highlighting for inline scripts like this. Works with other languages as well.
+        run: | # shell
           NODE_VERSION=$(node -p "require('./.build-config.json').versions.node")
           PYTHON_VERSION=$(node -p "require('./.build-config.json').versions.python")
           DOTNET_VERSION=$(node -p "require('./.build-config.json').versions.dotnet")
@@ -43,15 +45,15 @@ jobs:
           echo "dotnet=$DOTNET_VERSION" >> $GITHUB_OUTPUT
           echo "Node ${NODE_VERSION}, Python ${PYTHON_VERSION}, .NET ${DOTNET_VERSION}"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6.4
         with:
           node-version: ${{ steps.config.outputs.node }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6.2
         with:
           python-version: ${{ steps.config.outputs.python }}
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5.2
         with:
           dotnet-version: ${{ steps.config.outputs.dotnet }}.x
 
@@ -74,7 +76,7 @@ jobs:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
+        run: | #shell
           set -euo pipefail
           if [[ -z "${APPLE_CERTIFICATE_P12_BASE64:-}" ]]; then
               echo "APPLE_CERTIFICATE_P12_BASE64 not set — skipping (unsigned build)"
@@ -173,12 +175,12 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
           draft: true
@@ -212,3 +214,5 @@ jobs:
             -f event_type=desktop-released \
             -f "client_payload[version]=$version"
           echo "Dispatched desktop-released event (version=$version) to slopsmith."
+
+# Might want to consider something like this as well: https://github.com/marketplace/actions/github-releases-to-discord
